@@ -36,12 +36,12 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
 
-      - name: themes_data.json 커밋 & 푸시
+      - name: 결과 파일 커밋 & 푸시
         run: |
-          git add themes_data.json
+          git add themes_data.json surge_results.json || true
           if git diff --cached --quiet; then
             echo "변경사항 없음 — 커밋 생략"
           else
-            git commit -m "🔄 테마 데이터 자동 업데이트 $(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M KST')"
+            git commit -m "🔄 자동 업데이트 $(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M KST')"
             git push
           fi
