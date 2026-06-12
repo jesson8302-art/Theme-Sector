@@ -32,28 +32,64 @@ HEADERS = {
 
 
 def get_naver_theme_list() -> pd.DataFrame:
-    """네이버 금융 전체 테마 목록 크롤링"""
-    url = "https://finance.naver.com/sise/theme.nhn"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.encoding = "euc-kr"
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = []
-        for a in soup.select("td.col_type1 a"):
-            href = a.get("href", "")
-            if "no=" in href:
+    """네이버 금융 전체 테마 목록 크롤링 (페이지네이션 포함)"""
+    rows = []
+    seen_nos = set()
+
+    for page in range(1, 20):  # 최대 19페이지
+        url = f"https://finance.naver.com/sise/theme.nhn?page={page}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.encoding = "euc-kr"
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # 테마 링크 파싱: href에 no= 포함된 a 태그
+            page_rows = []
+            for a in soup.select("a[href*='sise_group_detail']"):
+                href = a.get("href", "")
+                if "no=" not in href:
+                    continue
                 try:
                     no = int(href.split("no=")[-1].split("&")[0])
                     name = a.get_text(strip=True)
-                    if name:
-                        rows.append({"no": no, "name": name})
+                    if name and no not in seen_nos:
+                        seen_nos.add(no)
+                        page_rows.append({"no": no, "name": name})
                 except ValueError:
                     continue
-        df = pd.DataFrame(rows).drop_duplicates("no").reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f"[ERROR] 테마 목록 크롤링 실패: {e}")
-        return pd.DataFrame()
+
+            if not page_rows:
+                break  # 더 이상 데이터 없음
+            rows.extend(page_rows)
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"[ERROR] 테마 목록 페이지 {page} 크롤링 실패: {e}")
+            break
+
+    # 첫 번째 방법이 실패했으면 원래 방식으로 fallback
+    if not rows:
+        try:
+            resp = requests.get("https://finance.naver.com/sise/theme.nhn",
+                                headers=HEADERS, timeout=20)
+            resp.encoding = "euc-kr"
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.select("td.col_type1 a"):
+                href = a.get("href", "")
+                if "no=" in href:
+                    try:
+                        no = int(href.split("no=")[-1].split("&")[0])
+                        name = a.get_text(strip=True)
+                        if name and no not in seen_nos:
+                            seen_nos.add(no)
+                            rows.append({"no": no, "name": name})
+                    except ValueError:
+                        continue
+        except Exception as e:
+            print(f"[ERROR] 테마 목록 fallback 실패: {e}")
+
+    df = pd.DataFrame(rows).drop_duplicates("no").reset_index(drop=True)
+    return df
 
 
 def get_naver_theme_stocks(theme_no: int) -> List[Dict]:
@@ -458,66 +494,68 @@ def update_themes(
     return result
 
 
-# ─── pykrx 급등주 유니버스 ────────────────────────────────────────────────────
+# ─── 네이버 거래대금 상위 급등주 유니버스 ────────────────────────────────────
 
 def get_surge_universe(top_n: int = 500) -> List[Dict]:
     """
-    pykrx로 당일 거래대금 상위 N개 종목 추출.
-    코스피 + 코스닥 전종목 대상.
+    네이버 금융 거래대금 상위 N개 종목 크롤링.
+    KOSPI + KOSDAQ 각각 페이지네이션하여 수집 후 합산.
+    pykrx 대신 네이버 크롤링 사용 (GitHub Actions 해외 서버에서도 동작).
     """
-    try:
-        from pykrx import stock as pykrx_stock
-    except ImportError:
-        print("[ERROR] pykrx 미설치. pip install pykrx 필요")
-        return []
+    all_results = []
+    seen_codes = set()
 
-    today = datetime.today()
-    # 최근 5영업일 중 데이터가 있는 날 찾기
-    for days_back in range(0, 7):
-        date_str = (today - timedelta(days=days_back)).strftime("%Y%m%d")
-        try:
-            df_kospi  = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market="KOSPI")
-            df_kosdaq = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market="KOSDAQ")
-            if df_kospi.empty and df_kosdaq.empty:
-                continue
+    for sosok, exch in [(0, "KS"), (1, "KQ")]:
+        market_name = "KOSPI" if sosok == 0 else "KOSDAQ"
+        for page in range(1, 25):  # 페이지당 ~50개, 최대 24페이지
+            url = (
+                f"https://finance.naver.com/sise/sise_trade_val.nhn"
+                f"?sosok={sosok}&page={page}"
+            )
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                resp.encoding = "euc-kr"
+                soup = BeautifulSoup(resp.text, "html.parser")
 
-            df_kospi["_exch"]  = "KS"
-            df_kosdaq["_exch"] = "KQ"
-            df_all = pd.concat([df_kospi, df_kosdaq])
-
-            # 거래대금 컬럼명 확인 (pykrx 버전에 따라 다를 수 있음)
-            tv_col = None
-            for col in ["거래대금", "거래금액", "TradingValue"]:
-                if col in df_all.columns:
-                    tv_col = col
+                table = soup.select_one("table.type_2")
+                if not table:
                     break
-            if tv_col is None:
-                print(f"[WARN] 거래대금 컬럼 없음: {df_all.columns.tolist()}")
-                tv_col = df_all.columns[-1]
 
-            df_all = df_all[df_all[tv_col] > 0].sort_values(tv_col, ascending=False)
+                page_found = 0
+                for row in table.select("tr"):
+                    cols = row.select("td")
+                    if len(cols) < 2:
+                        continue
+                    a = cols[1].select_one("a") if len(cols) > 1 else None
+                    if not a:
+                        continue
+                    href = a.get("href", "")
+                    if "code=" not in href:
+                        continue
+                    code = href.split("code=")[-1][:6]
+                    name = a.get_text(strip=True)
+                    if code and len(code) == 6 and code.isdigit() and code not in seen_codes:
+                        seen_codes.add(code)
+                        all_results.append({"code": code, "name": name, "exchange": exch})
+                        page_found += 1
 
-            results = []
-            for ticker, row in df_all.head(top_n).iterrows():
-                try:
-                    name = pykrx_stock.get_market_ticker_name(ticker)
-                except Exception:
-                    name = ticker
-                results.append({
-                    "code":     ticker,
-                    "name":     name,
-                    "exchange": row["_exch"],
-                })
+                if page_found == 0:
+                    break  # 빈 페이지 → 더 이상 데이터 없음
 
-            print(f"✅ pykrx {date_str} 기준 {len(results)}개 종목 추출")
-            return results
+                # 한쪽 시장에서 top_n/2 이상 모으면 충분
+                market_count = sum(1 for r in all_results if r["exchange"] == exch)
+                if market_count >= top_n // 2:
+                    break
 
-        except Exception as e:
-            print(f"[WARN] pykrx {date_str} 실패: {e}")
-            continue
+                time.sleep(0.2)
 
-    print("[ERROR] pykrx 유니버스 추출 실패 (모든 날짜 시도 완료)")
-    return []
+            except Exception as e:
+                print(f"[WARN] 거래대금 크롤링 실패 {market_name} page={page}: {e}")
+                break
+
+    print(f"✅ 네이버 거래대금 상위 {len(all_results[:top_n])}개 종목 추출 "
+          f"(KOSPI+KOSDAQ 합산)")
+    return all_results[:top_n]
 
 
 def scan_and_save_surge(
