@@ -5,7 +5,11 @@ Streamlit Cloud 단독 실행 버전
 실행: python -m streamlit run app.py
 """
 
+import json
+import os
+import time
 import warnings
+
 warnings.filterwarnings("ignore")
 
 from datetime import datetime, timedelta
@@ -100,6 +104,37 @@ THEMES: Dict[str, Dict] = {
         },
     },
 }
+
+# ─── 동적 테마 로딩 ──────────────────────────────────────────────────────────
+_THEMES_UPDATED_AT: Optional[str] = None
+THEMES_STAGES: Dict[str, int] = {}   # {theme_key: stage_number}
+
+
+def _try_load_dynamic_themes() -> None:
+    """themes_data.json이 있으면 THEMES·THEMES_STAGES를 동적 데이터로 덮어씁니다."""
+    global _THEMES_UPDATED_AT
+    path = "themes_data.json"
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        for key, val in data.items():
+            stocks = {c: tuple(v) for c, v in val.get("stocks", {}).items()}
+            if key in THEMES:
+                THEMES[key]["stocks"] = stocks
+            else:
+                THEMES[key] = {"name": val["name"], "stocks": stocks}
+            if "stage" in val:
+                THEMES_STAGES[key] = int(val["stage"])
+        times = [v.get("updated_at", "") for v in data.values() if v.get("updated_at")]
+        if times:
+            _THEMES_UPDATED_AT = max(times)[:16].replace("T", " ")
+    except Exception:
+        pass
+
+
+_try_load_dynamic_themes()
 
 STAGE_INFO = {
     0: {"name": "데이터 부족",   "en": "Insufficient",  "emoji": "❓", "color": "#808080"},
@@ -738,6 +773,18 @@ def render_sidebar():
         run = st.button("🔍 분석 실행", use_container_width=True, type="primary")
 
         st.divider()
+        # 업데이트 시각 표시
+        if _THEMES_UPDATED_AT:
+            st.caption(f"🕐 마지막 재분석: {_THEMES_UPDATED_AT}")
+        else:
+            st.caption("📌 기본 테마 사용 중 (재분석 미실시)")
+        refresh = st.button(
+            "🔄 테마 종목 재분석",
+            use_container_width=True,
+            help="네이버 증권 크롤링 → TF-IDF 매칭 → LSS 선정. 수 분 소요.",
+        )
+
+        st.divider()
         with st.expander("ℹ️ LSS란 무엇인가요?"):
             st.markdown("""
 **LSS(Leader Stock Score)**는 테마 내에서 **'대장주'가 누구인지** 찾는 점수입니다.
@@ -766,16 +813,147 @@ def render_sidebar():
 </div>
 """, unsafe_allow_html=True)
 
-        return selected, run
+        st.divider()
+        stage_filter = st.button(
+            "🎯 Stage 2·3 핵심 테마만 보기",
+            use_container_width=True,
+            help="모멘텀 돌파기·주도 상승기 테마만 필터링. 재분석 후 즉시 반영됩니다.",
+        )
+
+        return selected, run, refresh, stage_filter
+
+
+# ─── Stage 2·3 필터 뷰 ────────────────────────────────────────────────────────
+
+def render_stage_filter_view():
+    """Stage 2·3 핵심 테마 전용 뷰"""
+    st.markdown("## 🎯 Stage 2·3 핵심 테마")
+
+    if not THEMES_STAGES:
+        st.warning(
+            "아직 생애주기 데이터가 없습니다.\n\n"
+            "왼쪽 **🔄 테마 종목 재분석** 버튼을 먼저 실행해주세요. "
+            "재분석 완료 후 생애주기가 자동으로 계산됩니다."
+        )
+        return
+
+    stage_2_3 = {k: THEMES[k] for k in THEMES_STAGES
+                 if THEMES_STAGES[k] in (2, 3) and k in THEMES}
+    all_stages = {k: THEMES[k] for k in THEMES_STAGES if k in THEMES}
+
+    if stage_2_3:
+        st.success(
+            f"**{len(stage_2_3)}개 테마**가 현재 모멘텀 구간(Stage 2·3)입니다. "
+            "이 테마의 LSS 1~2위 종목을 주목하세요."
+        )
+        cols = st.columns(min(len(stage_2_3), 2))
+        for i, (key, theme) in enumerate(stage_2_3.items()):
+            stage = THEMES_STAGES[key]
+            info  = STAGE_INFO[stage]
+            with cols[i % 2]:
+                with st.container(border=True):
+                    st.markdown(
+                        f"### {info['emoji']} {theme['name']}  \n"
+                        f"<span style='color:{info['color']};font-weight:700'>"
+                        f"Stage {stage} · {info['name']}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("**구성 종목 (LSS 순위)**")
+                    for j, (code, (name, _)) in enumerate(
+                        list(theme["stocks"].items())[:5]
+                    ):
+                        medal = {0: "👑", 1: "🥈", 2: "🥉"}.get(j, f"`{j+1}`")
+                        st.markdown(f"{medal} {name} &nbsp;`{code}`",
+                                    unsafe_allow_html=True)
+                    st.caption(f"📅 {_THEMES_UPDATED_AT or '업데이트 시각 미확인'}")
+    else:
+        st.info(
+            "현재 Stage 2·3에 해당하는 테마가 없습니다.\n\n"
+            "전체 테마 현황을 아래 표에서 확인하세요."
+        )
+
+    # 전체 테마 현황 요약표
+    st.markdown("---")
+    st.markdown("### 📊 전체 테마 생애주기 현황")
+    rows = []
+    for key, theme in all_stages.items():
+        stage = THEMES_STAGES.get(key, 0)
+        info  = STAGE_INFO.get(stage, STAGE_INFO[0])
+        top1  = list(theme["stocks"].values())
+        top1_name = top1[0][0] if top1 else "─"
+        rows.append({
+            "테마":    theme["name"],
+            "단계":    f"{info['emoji']} Stage {stage} · {info['name']}",
+            "대장주":  top1_name,
+            "주목":    "✅" if stage in (2, 3) else ("⚠️" if stage == 4 else "─"),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(f"마지막 업데이트: {_THEMES_UPDATED_AT or '미실시'}")
 
 
 # ─── 메인 ─────────────────────────────────────────────────────────────────────
 
 def main():
-    selected, run = render_sidebar()
+    selected, run, refresh, stage_filter = render_sidebar()
 
     if "data" not in st.session_state:
         st.session_state.data = None
+
+    # ── 테마 재분석 ────────────────────────────────────────────────────────
+    if refresh:
+        st.markdown("## 🔄 테마 종목 재분석")
+        st.info(
+            "네이버 증권 크롤링 → TF-IDF 매칭 → 주가 로드 → LSS 선정 순으로 진행됩니다.\n"
+            "종목 수에 따라 **3~10분** 소요될 수 있습니다. 창을 닫지 마세요."
+        )
+        with st.status("재분석 진행 중...", expanded=True) as status:
+            try:
+                from crawler import update_themes as _run_crawler
+
+                # GitHub 자동 커밋 설정 (Streamlit secrets에서 읽기)
+                try:
+                    _gh_token  = st.secrets.get("GITHUB_TOKEN", "")
+                    _gh_repo   = st.secrets.get("GITHUB_REPO", "")
+                    _gh_branch = st.secrets.get("GITHUB_BRANCH", "main")
+                except Exception:
+                    _gh_token = _gh_repo = _gh_branch = ""
+
+                logs: List[str] = []
+                log_box = st.empty()
+
+                def _on_progress(msg: str) -> None:
+                    logs.append(msg)
+                    log_box.code("\n".join(logs[-30:]), language=None)
+
+                result = _run_crawler(
+                    progress_callback=_on_progress,
+                    github_token=_gh_token,
+                    github_repo=_gh_repo,
+                    github_branch=_gh_branch or "main",
+                )
+
+                if result:
+                    status.update(
+                        label=f"✅ 재분석 완료! ({len(result)}개 테마 업데이트)",
+                        state="complete",
+                    )
+                    st.cache_data.clear()
+                    time.sleep(1.5)
+                    st.rerun()
+                else:
+                    status.update(label="⚠️ 결과 없음 — 네이버 접속 문제일 수 있습니다.", state="error")
+            except ImportError:
+                status.update(label="❌ crawler.py 파일을 찾을 수 없습니다.", state="error")
+                st.error("같은 폴더에 crawler.py 파일이 있는지 확인하세요.")
+            except Exception as e:
+                status.update(label=f"❌ 오류: {e}", state="error")
+        return
+
+    # ── Stage 2·3 필터 뷰 ──────────────────────────────────────────────────
+    if stage_filter:
+        render_stage_filter_view()
+        return
 
     if not run and st.session_state.data is None:
         st.markdown("""
