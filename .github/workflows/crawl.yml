@@ -1,0 +1,47 @@
+name: 테마 데이터 자동 업데이트
+
+on:
+  schedule:
+    # 평일(월~금) 오후 6시 KST = 오전 9시 UTC
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+    # 수동 실행 버튼 (GitHub 웹에서 즉시 실행 가능)
+
+permissions:
+  contents: write  # themes_data.json 커밋 권한
+
+jobs:
+  update-themes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 최대 2시간
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 크롤러 실행
+        run: python crawler.py
+
+      - name: Git 설정
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: themes_data.json 커밋 & 푸시
+        run: |
+          git add themes_data.json
+          if git diff --cached --quiet; then
+            echo "변경사항 없음 — 커밋 생략"
+          else
+            git commit -m "🔄 테마 데이터 자동 업데이트 $(TZ='Asia/Seoul' date +'%Y-%m-%d %H:%M KST')"
+            git push
+          fi
