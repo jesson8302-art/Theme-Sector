@@ -18,6 +18,8 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from scipy import stats
 
+from surge_engine import SurgeLogicEngine, get_surge_status
+
 # ─── 네이버 크롤링 ────────────────────────────────────────────────────────────
 
 HEADERS = {
@@ -456,6 +458,144 @@ def update_themes(
     return result
 
 
+# ─── pykrx 급등주 유니버스 ────────────────────────────────────────────────────
+
+def get_surge_universe(top_n: int = 500) -> List[Dict]:
+    """
+    pykrx로 당일 거래대금 상위 N개 종목 추출.
+    코스피 + 코스닥 전종목 대상.
+    """
+    try:
+        from pykrx import stock as pykrx_stock
+    except ImportError:
+        print("[ERROR] pykrx 미설치. pip install pykrx 필요")
+        return []
+
+    today = datetime.today()
+    # 최근 5영업일 중 데이터가 있는 날 찾기
+    for days_back in range(0, 7):
+        date_str = (today - timedelta(days=days_back)).strftime("%Y%m%d")
+        try:
+            df_kospi  = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market="KOSPI")
+            df_kosdaq = pykrx_stock.get_market_ohlcv_by_ticker(date_str, market="KOSDAQ")
+            if df_kospi.empty and df_kosdaq.empty:
+                continue
+
+            df_kospi["_exch"]  = "KS"
+            df_kosdaq["_exch"] = "KQ"
+            df_all = pd.concat([df_kospi, df_kosdaq])
+
+            # 거래대금 컬럼명 확인 (pykrx 버전에 따라 다를 수 있음)
+            tv_col = None
+            for col in ["거래대금", "거래금액", "TradingValue"]:
+                if col in df_all.columns:
+                    tv_col = col
+                    break
+            if tv_col is None:
+                print(f"[WARN] 거래대금 컬럼 없음: {df_all.columns.tolist()}")
+                tv_col = df_all.columns[-1]
+
+            df_all = df_all[df_all[tv_col] > 0].sort_values(tv_col, ascending=False)
+
+            results = []
+            for ticker, row in df_all.head(top_n).iterrows():
+                try:
+                    name = pykrx_stock.get_market_ticker_name(ticker)
+                except Exception:
+                    name = ticker
+                results.append({
+                    "code":     ticker,
+                    "name":     name,
+                    "exchange": row["_exch"],
+                })
+
+            print(f"✅ pykrx {date_str} 기준 {len(results)}개 종목 추출")
+            return results
+
+        except Exception as e:
+            print(f"[WARN] pykrx {date_str} 실패: {e}")
+            continue
+
+    print("[ERROR] pykrx 유니버스 추출 실패 (모든 날짜 시도 완료)")
+    return []
+
+
+def scan_and_save_surge(
+    universe: List[Dict],
+    output_path: str = "surge_results.json",
+    progress_callback: Optional[Callable] = None,
+) -> Dict:
+    """
+    유니버스 종목들에 SurgeLogicEngine 적용 → surge_results.json 저장
+    """
+    def log(msg):
+        print(msg)
+        if progress_callback:
+            progress_callback(msg)
+
+    end_dt   = datetime.today().strftime("%Y-%m-%d")
+    start_dt = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
+
+    log(f"🔍 급등주 스캔 시작: {len(universe)}개 종목")
+    results = []
+    success = 0
+
+    for i, item in enumerate(universe):
+        code = item["code"]
+        name = item["name"]
+        exch = item["exchange"]
+
+        df, actual_exch = load_stock_with_exchange(code, start_dt, end_dt)
+        if df is None or len(df) < 60:
+            continue
+        if actual_exch:
+            exch = actual_exch
+
+        try:
+            res = SurgeLogicEngine.scan(df)
+        except Exception:
+            continue
+
+        roc_1d = (
+            f"{(df['Close'].iloc[-1] / df['Close'].iloc[-2] - 1) * 100:+.1f}%"
+            if len(df) > 1 else "─"
+        )
+        score = res["top_score"]
+        success += 1
+
+        results.append({
+            "code":        code,
+            "name":        name,
+            "exchange":    exch,
+            "close":       int(df["Close"].iloc[-1]),
+            "roc_1d":      roc_1d,
+            "top_pattern": res["top_pattern"],
+            "top_score":   score,
+            "matched":     res["matched"],
+            "status":      get_surge_status(score),
+        })
+
+        if (i + 1) % 100 == 0:
+            log(f"  ↳ {i+1}/{len(universe)} 스캔 완료 (성공: {success}개)...")
+        time.sleep(0.05)
+
+    # 스코어 내림차순 정렬
+    results.sort(key=lambda x: x["top_score"], reverse=True)
+
+    output = {
+        "updated_at":    datetime.now().isoformat(),
+        "universe_size": len(universe),
+        "scanned":       success,
+        "results":       results,
+    }
+    json_str = json.dumps(output, ensure_ascii=False, indent=2)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(json_str)
+
+    log(f"✅ surge_results.json 저장 완료 ({len(results)}개 종목, 스코어 순 정렬)")
+    return output
+
+
 # ─── 단독 실행 엔트리포인트 (GitHub Actions) ─────────────────────────────────
 
 if __name__ == "__main__":
@@ -464,6 +604,7 @@ if __name__ == "__main__":
     print(f"   실행 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
+    # ── 1단계: 테마 데이터 업데이트 ─────────────────────────────────────────
     result = update_themes(
         output_path="themes_data.json",
         max_themes=None,           # None = 네이버 전체 테마
@@ -473,7 +614,24 @@ if __name__ == "__main__":
         github_token="",
         github_repo="",
     )
+    print(f"✅ 테마 업데이트 완료: {len(result)}개 테마")
+
+    # ── 2단계: 급등주 스캔 (거래대금 상위 500개) ─────────────────────────────
+    print("\n" + "=" * 60)
+    print("🎯 급등주 스캔 시작 (거래대금 상위 500개)")
+    print("=" * 60)
+
+    universe = get_surge_universe(top_n=500)
+    if universe:
+        scan_and_save_surge(
+            universe=universe,
+            output_path="surge_results.json",
+            progress_callback=print,
+        )
+        print("✅ surge_results.json 저장 완료")
+    else:
+        print("⚠️ 유니버스 추출 실패 — 급등주 스캔 생략")
 
     print("=" * 60)
-    print(f"✅ 완료: {len(result)}개 테마 업데이트")
+    print("🏁 모든 작업 완료")
     print("=" * 60)
