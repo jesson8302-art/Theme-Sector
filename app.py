@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from surge_engine import SurgeLogicEngine, SENSITIVITY_THRESHOLD, get_surge_status
 from plotly.subplots import make_subplots
 from scipy import stats
 
@@ -403,167 +404,19 @@ def determine_stage(theme_df, stocks) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 급등주 탐지 엔진 (SurgeLogicEngine)
+# 급등주 — 사전계산 로더
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SurgeLogicEngine:
-    """5가지 급등 패턴 정량 탐지 엔진"""
-
-    @staticmethod
-    def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        for span in [5, 10, 20, 60]:
-            df[f"EMA_{span}"] = df["Close"].ewm(span=span, adjust=False).mean()
-        df["VOL_5"]  = df["Volume"].rolling(5).mean()
-        df["VOL_20"] = df["Volume"].rolling(20).mean()
-        df["BB_MID"]   = df["Close"].rolling(20).mean()
-        df["BB_STD"]   = df["Close"].rolling(20).std()
-        df["BB_UPPER"] = df["BB_MID"] + df["BB_STD"] * 2
-        df["BB_LOWER"] = df["BB_MID"] - df["BB_STD"] * 2
-        df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MID"].replace(0, np.nan)
-        obv = [0]
-        for i in range(1, len(df)):
-            c, p = df["Close"].iloc[i], df["Close"].iloc[i-1]
-            v = df["Volume"].iloc[i]
-            obv.append(obv[-1] + v if c > p else (obv[-1] - v if c < p else obv[-1]))
-        df["OBV"] = obv
-        return df
-
-    @classmethod
-    def check_p1_ma_squeeze(cls, df: pd.DataFrame):
-        """P1: 이평선 극한 수렴 + 거래량 씨마름"""
-        if len(df) < 60: return False, 0
-        latest = df.iloc[-1]
-        emas = [latest[f"EMA_{s}"] for s in [5,10,20,60] if f"EMA_{s}" in df.columns]
-        if not emas: return False, 0
-        spread = (max(emas) - min(emas)) / min(emas) * 100 if min(emas) > 0 else 99
-        is_squeeze = spread <= 3.0
-        is_vol_dry = latest["VOL_5"] <= latest["VOL_20"] * 0.35 if latest["VOL_20"] > 0 else False
-        score = 0
-        if is_squeeze: score += 50
-        if is_vol_dry: score += 40
-        if spread <= 1.5: score += 10
-        return score >= 70, min(score, 100)
-
-    @classmethod
-    def check_p2_accumulation(cls, df: pd.DataFrame):
-        """P2: 세력 매집 기준봉 후 눌림목"""
-        if len(df) < 30: return False, 0
-        recent = df.tail(20).copy()
-        target = recent[
-            (recent["Close"] / recent["Open"].replace(0, np.nan) >= 1.15) &
-            (recent["Volume"] >= recent["VOL_20"] * 5.0)
-        ]
-        if target.empty: return False, 0
-        ref = target.iloc[-1]
-        after = df.loc[ref.name + 1:] if ref.name + 1 <= df.index[-1] else pd.DataFrame()
-        if after.empty: return False, 0
-        center = (ref["High"] + ref["Low"]) / 2
-        is_supported = after["Close"].min() >= center
-        is_vol_down  = after["Volume"].mean() <= ref["Volume"] * 0.30
-        score = 60
-        if is_supported: score += 20
-        if is_vol_down:  score += 20
-        return score >= 70, min(score, 100)
-
-    @classmethod
-    def check_p3_obv_divergence(cls, df: pd.DataFrame):
-        """P3: OBV 상승 다이버전스 & 쌍바닥"""
-        if len(df) < 60: return False, 0
-        recent = df.tail(60).reset_index(drop=True)
-        mid = len(recent) // 2
-        lo1_idx = recent["Close"].iloc[:mid].idxmin()
-        lo2_idx = recent["Close"].iloc[mid:].idxmin() + mid
-        price1, price2 = recent["Close"].iloc[lo1_idx], recent["Close"].iloc[lo2_idx]
-        obv1,   obv2   = recent["OBV"].iloc[lo1_idx],   recent["OBV"].iloc[lo2_idx]
-        price_lower = price2 <= price1 * 1.03
-        obv_higher  = obv2 > obv1
-        score = 0
-        if price_lower and obv_higher:
-            score += 60
-            ratio = abs(obv2 - obv1) / (abs(obv1) + 1) * 100
-            if ratio > 5:  score += 20
-            if ratio > 15: score += 20
-        return score >= 70, min(score, 100)
-
-    @classmethod
-    def check_p4_bb_squeeze(cls, df: pd.DataFrame):
-        """P4: 볼린저밴드 극한 수렴 후 상단 돌파"""
-        if len(df) < 60: return False, 0
-        recent = df.tail(min(120, len(df)))
-        current = df.iloc[-1]
-        bw_series = recent["BB_WIDTH"].dropna()
-        if bw_series.empty: return False, 0
-        min_bw   = bw_series.min()
-        cur_bw   = current["BB_WIDTH"] if pd.notna(current["BB_WIDTH"]) else 99
-        is_squeeze   = cur_bw <= min_bw * 1.6
-        broke_upper  = current["Close"] >= current["BB_UPPER"] * 0.97 if pd.notna(current["BB_UPPER"]) else False
-        vol_surge    = current["VOL_5"] >= current["VOL_20"] * 1.5 if current["VOL_20"] > 0 else False
-        score = 0
-        if is_squeeze:  score += 35
-        if broke_upper: score += 45
-        if vol_surge:   score += 20
-        return score >= 70, min(score, 100)
-
-    @classmethod
-    def check_p5_cup_handle(cls, df: pd.DataFrame):
-        """P5: 컵앤핸들 패턴"""
-        if len(df) < 90: return False, 0
-        cup_data    = df.tail(90).head(60)
-        handle_data = df.tail(30)
-        cup_high  = cup_data["Close"].max()
-        cup_low   = cup_data["Close"].min()
-        cup_depth = (cup_high - cup_low) / cup_high * 100 if cup_high > 0 else 0
-        handle_high = handle_data["Close"].max()
-        handle_low  = handle_data["Close"].min()
-        handle_depth = (handle_high - handle_low) / handle_high * 100 if handle_high > 0 else 99
-        cur_price = df.iloc[-1]["Close"]
-        near_rim  = cur_price >= cup_high * 0.94
-        good_cup  = 12 <= cup_depth <= 55
-        shallow_handle = handle_depth <= 15
-        vol_contract   = handle_data["Volume"].mean() <= cup_data["Volume"].mean() * 0.75
-        score = 0
-        if good_cup:        score += 30
-        if shallow_handle:  score += 25
-        if near_rim:        score += 25
-        if vol_contract:    score += 20
-        return score >= 70, min(score, 100)
-
-    @classmethod
-    def scan(cls, df: pd.DataFrame) -> Dict:
-        df = cls.calculate_indicators(df)
-        patterns = {
-            "P1 이평선 응축": cls.check_p1_ma_squeeze(df),
-            "P2 매집봉 눌림목": cls.check_p2_accumulation(df),
-            "P3 OBV 다이버전스": cls.check_p3_obv_divergence(df),
-            "P4 볼린저 수렴돌파": cls.check_p4_bb_squeeze(df),
-            "P5 컵앤핸들": cls.check_p5_cup_handle(df),
-        }
-        top_name = max(patterns, key=lambda k: patterns[k][1])
-        top_score = patterns[top_name][1]
-        matched = [name for name, (m, _) in patterns.items() if m]
-        return {
-            "patterns": {n: {"match": m, "score": s} for n, (m, s) in patterns.items()},
-            "top_pattern": top_name,
-            "top_score": top_score,
-            "matched": matched,
-            "is_signal": top_score >= 70,
-        }
-
-
-SENSITIVITY_THRESHOLD = {1: 0, 2: 55, 3: 68, 4: 82, 5: 91}
-SURGE_STATUS = {
-    (90, 101): "🔥 강력 매수",
-    (80, 90):  "✅ 트리거 포착",
-    (70, 80):  "👀 관찰 진입",
-    (0,  70):  "─ 대기",
-}
-
-def _surge_status(score: int) -> str:
-    for (lo, hi), label in SURGE_STATUS.items():
-        if lo <= score < hi:
-            return label
-    return "─"
+def _load_surge_precomputed() -> Optional[Dict]:
+    """surge_results.json 로드 (없으면 None)"""
+    if not os.path.exists("surge_results.json"):
+        return None
+    try:
+        with open("surge_results.json", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if data.get("results") else None
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -606,7 +459,7 @@ def run_surge_scan(scope_key: str, sensitivity: int) -> List[Dict]:
             "현재가":   int(df["Close"].iloc[-1]),
             "등락률":   f"{roc_1d:+.1f}%",
             "스코어":   score,
-            "신호":     _surge_status(score),
+            "신호":     get_surge_status(score),
             "_matched": res["matched"],
             "_df":      df,
         })
@@ -894,40 +747,110 @@ def render_lss_cards(lss_df, name_map, stocks, stage):
 
 def render_surge_detector(scope_key: str, sensitivity: int):
     st.markdown("## 🎯 급등주 탐지 시스템")
-    scope_name = "전체 테마" if scope_key == "_all_" else THEMES.get(scope_key, {}).get("name", scope_key)
+    threshold = SENSITIVITY_THRESHOLD[sensitivity]
+
+    # ── 사전 계산 데이터 우선 표시 ─────────────────────────────────────────
+    precomputed = _load_surge_precomputed()
+    if precomputed:
+        updated_at    = precomputed.get("updated_at", "")[:16].replace("T", " ")
+        universe_size = precomputed.get("universe_size", 0)
+        scanned       = precomputed.get("scanned", 0)
+        all_results   = precomputed.get("results", [])
+
+        st.info(
+            f"📊 **자동 수집 데이터** | 마지막 업데이트: **{updated_at}** | "
+            f"스캔 종목: **{scanned:,}개** (거래대금 상위 {universe_size:,}개 중)"
+        )
+
+        results = [r for r in all_results if r["top_score"] >= threshold]
+
+        if not results:
+            st.info("현재 엄격도 기준에 해당하는 종목이 없습니다. 엄격도를 낮춰보세요.")
+            return
+
+        st.success(f"**{len(results)}개 종목** 탐지 (스코어 {threshold}점 이상)")
+
+        # 요약 테이블
+        display_df = pd.DataFrame([{
+            "종목명":   r["name"],
+            "코드":     r["code"],
+            "탐지 패턴":r["top_pattern"],
+            "현재가":   f"{r.get('close', 0):,}원",
+            "등락률":   r.get("roc_1d", "─"),
+            "스코어":   r["top_score"],
+            "신호":     r["status"],
+        } for r in results])
+        st.dataframe(
+            display_df,
+            column_config={"스코어": st.column_config.ProgressColumn(
+                "매칭 스코어", min_value=0, max_value=100, format="%d점")},
+            use_container_width=True, hide_index=True,
+        )
+
+        # 개별 상세 (상위 30개)
+        st.markdown("---")
+        st.markdown("### 📋 종목별 상세")
+        end_dt   = datetime.today().strftime("%Y-%m-%d")
+        start_dt = (datetime.today() - timedelta(days=200)).strftime("%Y-%m-%d")
+
+        for r in results[:30]:
+            score = r["top_score"]
+            color = "#16a34a" if score >= 85 else ("#2563eb" if score >= 70 else "#6b7280")
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"### {r['status']} {r['name']} `{r['code']}`")
+                    st.caption(f"탐지 패턴: {r['top_pattern']} | 등락률: {r.get('roc_1d','─')}")
+                    if r.get("matched"):
+                        st.markdown("**매칭 패턴:** " + " · ".join(r["matched"]))
+                with c2:
+                    st.markdown(
+                        f'<div style="text-align:center;padding:10px;background:#f8fafc;'
+                        f'border-radius:8px;border:2px solid {color};">'
+                        f'<div style="font-size:1.8rem;font-weight:900;color:{color}">{score}</div>'
+                        f'<div style="font-size:0.75rem;color:#6b7280">/ 100점</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with st.expander(f"📈 {r['name']} 차트 보기"):
+                    df = load_stock(r["code"], r.get("exchange", "KS"), start_dt, end_dt)
+                    if df is not None:
+                        st.plotly_chart(make_stock_chart(df, r["name"]), use_container_width=True)
+                    else:
+                        st.warning("차트 데이터 로드 실패")
+        return
+
+    # ── 폴백: 테마 종목 실시간 스캔 ──────────────────────────────────────────
+    scope_name  = "전체 테마" if scope_key == "_all_" else THEMES.get(scope_key, {}).get("name", scope_key)
     stock_count = (
         sum(len(t["stocks"]) for t in THEMES.values())
         if scope_key == "_all_"
         else len(THEMES.get(scope_key, {}).get("stocks", {}))
     )
-    st.caption(f"스캔 범위: **{scope_name}** ({stock_count}개 종목) | 엄격도: {sensitivity}/5")
+    st.warning("⚠️ 사전 계산 데이터 없음 — 테마 종목 실시간 스캔으로 대체합니다.")
+    st.caption(f"스캔 범위: **{scope_name}** ({stock_count}개 종목)")
 
-    with st.spinner(f"📡 {stock_count}개 종목 패턴 분석 중... (30~90초 소요)"):
-        results = run_surge_scan(scope_key, sensitivity)
+    with st.spinner(f"📡 {stock_count}개 종목 패턴 분석 중..."):
+        results_rt = run_surge_scan(scope_key, sensitivity)
 
-    if not results:
-        st.info("현재 설정 기준에 해당하는 종목이 없습니다. 엄격도를 낮춰 다시 시도해보세요.")
+    if not results_rt:
+        st.info("현재 설정 기준에 해당하는 종목이 없습니다.")
         return
 
-    st.success(f"**{len(results)}개 종목** 탐지 완료")
-
-    # 결과 요약 테이블
+    st.success(f"**{len(results_rt)}개 종목** 탐지 완료")
     display_df = pd.DataFrame([{
         "종목명": r["종목명"], "코드": r["코드"],
         "탐지 패턴": r["패턴"], "현재가": f"{r['현재가']:,}원",
         "등락률": r["등락률"], "스코어": r["스코어"], "신호": r["신호"],
-    } for r in results])
+    } for r in results_rt])
     st.dataframe(
         display_df,
         column_config={"스코어": st.column_config.ProgressColumn(
             "매칭 스코어", min_value=0, max_value=100, format="%d점")},
         use_container_width=True, hide_index=True,
     )
-
-    # 개별 종목 상세
     st.markdown("---")
     st.markdown("### 📋 종목별 상세")
-    for r in results:
+    for r in results_rt:
         score = r["스코어"]
         color = "#16a34a" if score >= 85 else ("#2563eb" if score >= 70 else "#6b7280")
         with st.container(border=True):
